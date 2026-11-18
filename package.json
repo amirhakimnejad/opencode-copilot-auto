@@ -1,0 +1,13 @@
+{
+  "name": "opencode-copilot-auto",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that makes GitHub Copilot Free work by routing requests through Copilot's Auto mode",
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js" },
+  "files": ["index.js", "README.md", "LICENSE"],
+  "scripts": { "test": "node --test" },
+  "keywords": ["opencode", "opencode-plugin", "github-copilot", "copilot-free"],
+  "engines": { "node": ">=22.5" },
+  "license": "MIT"
+}
