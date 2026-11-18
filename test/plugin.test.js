@@ -14,7 +14,10 @@ const MODELS = {
   ],
 }
 
-function setup({ user = FREE_USER, auto, credential = { token: "gho_test", metadata: {} }, mode, fail = {} } = {}) {
+const PAID_MODELS = { data: MODELS.data.map((m) => ({ ...m, model_picker_enabled: true, billing: { auto_discount: 0.1 } })) }
+
+function setup({ user = FREE_USER, models, auto, credential = { token: "gho_test", metadata: {} }, mode, fail = {} } = {}) {
+  models ??= user === PAID_USER ? PAID_MODELS : MODELS
   let clock = 1_800_000_000_000
   const calls = []
   let autoCount = 0
@@ -23,7 +26,7 @@ function setup({ user = FREE_USER, auto, credential = { token: "gho_test", metad
     calls.push({ url, path, init })
     if (fail[path]) return { ok: false, status: fail[path], json: async () => ({}) }
     if (path === "/copilot_internal/user") return { ok: true, json: async () => user }
-    if (path === "/models") return { ok: true, json: async () => MODELS }
+    if (path === "/models") return { ok: true, json: async () => models }
     if (path === "/auto") {
       autoCount++
       const answer = auto ? auto(autoCount) : { selected_model: { id: "mai-code-2-flash" }, session_token: "auto-token-" + autoCount, expires_at: clock / 1000 + 3600 }
@@ -142,12 +145,25 @@ test("no session token once the pick has expired", async () => {
   assert.equal(t.request("mai-code-2-flash").headers["Copilot-Session-Token"], undefined)
 })
 
-test("paid plan: does nothing and never lists models", async () => {
+test("an account OpenCode can serve itself is left alone", async () => {
   const t = setup({ user: PAID_USER })
   await t.plugin.setup(t.ctx)
   const call = await t.resolve("gpt-6-luna")
   assert.equal(call.model.id, "gpt-6-luna")
-  assert.equal(t.calls.some((c) => c.path === "/models" || c.path === "/auto"), false)
+  assert.equal(t.autoCount(), 0)
+})
+
+test("an account with only an Auto discount is left alone too", async () => {
+  const models = { data: MODELS.data.map((m) => ({ ...m, billing: { auto_discount: 0.1 } })) }
+  const t = setup({ models })
+  await t.plugin.setup(t.ctx)
+  assert.equal((await t.resolve("gpt-6-luna")).model.id, "gpt-6-luna")
+})
+
+test("detection doesn't depend on GitHub's plan name", async () => {
+  const t = setup({ user: { access_type_sku: "some_future_plan_name", endpoints: FREE_USER.endpoints } })
+  await t.plugin.setup(t.ctx)
+  assert.equal((await t.resolve("gpt-6-luna")).model.id, "mai-code-2-flash")
 })
 
 test("OPENCODE_COPILOT_AUTO=always routes on a paid plan too", async () => {
@@ -221,13 +237,13 @@ test("compaction makes the session ask Auto again", async () => {
   assert.equal(t.autoCount(), 2)
 })
 
-test("a new Copilot login drops the old pick at the next account check", async () => {
+test("a new Copilot login is noticed within 30 seconds and drops the old pick", async () => {
   const credential = { token: "gho_one", metadata: {} }
   const t = setup({ credential })
   await t.plugin.setup(t.ctx)
   await t.resolve("mai-code-2-flash")
   credential.token = "gho_two"
-  t.advance(61 * 60 * 1000) // past the hourly account check
+  t.advance(31 * 1000)
   await t.resolve("mai-code-2-flash")
   assert.equal(t.autoCount(), 2)
   const last = t.calls.filter((c) => c.path === "/auto").at(-1)
@@ -277,4 +293,42 @@ test("reads the Copilot login through OpenCode's integration API", async () => {
   assert.equal(await readCredentialFromOpenCode(ctx({ type: "key", key: "k" })), undefined)
   assert.equal(await readCredentialFromOpenCode(ctx(undefined, null)), undefined)
   assert.equal(await readCredentialFromOpenCode({}), undefined)
+})
+
+test("after disconnecting Copilot the plugin steps aside instead of failing", async () => {
+  let credential = { token: "gho_one", metadata: {} }
+  const t = setup()
+  const { createPlugin } = await import("../index.js")
+  let clock = 1_800_000_000_000
+  const plugin = createPlugin({
+    fetch: async (url) => {
+      const path = new URL(url).pathname
+      if (path === "/copilot_internal/user") return { ok: true, json: async () => FREE_USER }
+      if (path === "/models") return { ok: true, json: async () => MODELS }
+      return { ok: true, json: async () => ({ selected_model: { id: "mai-code-2-flash" }, session_token: "t", expires_at: 4e9 }) }
+    },
+    readCredential: async () => credential,
+    now: () => clock,
+  })
+  await plugin.setup(t.ctx)
+  assert.equal((await t.resolve("gpt-6-luna")).model.id, "mai-code-2-flash")
+  credential = undefined
+  clock += 31 * 1000
+  assert.equal((await t.resolve("gpt-6-luna", "s2")).model.id, "gpt-6-luna")
+})
+
+test("a login that can't be read is treated as no login", async () => {
+  const t = setup()
+  const { createPlugin } = await import("../index.js")
+  const plugin = createPlugin({ fetch: async () => { throw new Error("no network expected") }, readCredential: async () => { throw new Error("boom") } })
+  await plugin.setup(t.ctx)
+  assert.equal((await t.resolve("gpt-6-luna")).model.id, "gpt-6-luna")
+})
+
+test("a model list rebuild that throws doesn't break setup", async () => {
+  const t = setup()
+  t.ctx.model.reload = () => { throw new Error("not now") }
+  await t.plugin.setup(t.ctx)
+  await new Promise((r) => setTimeout(r, 10))
+  assert.equal((await t.resolve("gpt-6-luna")).model.id, "mai-code-2-flash")
 })

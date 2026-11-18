@@ -6,11 +6,13 @@
 // carry an Auto discount, which Free doesn't, so every request fails with
 // "The requested model is not supported" and the model picker stays empty.
 //
-// On a Copilot Free account this plugin:
+// It turns on only when OpenCode can't serve the account by itself: GitHub marks
+// none of the account's models as pickable and none has an Auto discount. That is
+// Copilot Free today. It then:
 //   - shows the chat models GitHub allows the account in the model picker,
 //   - when one of them is used, asks Auto which model to run and routes the
 //     request there with Auto's session token (Auto decides, not the pick).
-// On any other plan it does nothing, so OpenCode's own Copilot support is untouched.
+// On any other account it does nothing, so OpenCode's own Copilot support is untouched.
 //
 // Set OPENCODE_COPILOT_AUTO=off to turn it off, or =always to route through Auto
 // whatever the plan.
@@ -22,6 +24,7 @@ const PROVIDER = "github-copilot"
 const USER_AGENT = `opencode-copilot-auto/${VERSION}`
 const API_VERSION = "2026-08-01" // what OpenCode 2.3 sends to the Copilot API
 const USER_API_VERSION = "2025-04-01" // what OpenCode 2.3 sends to copilot_internal/user
+const CREDENTIAL_TTL_MS = 30 * 1000 // notice a reconnect or disconnect within 30 seconds
 const ACCOUNT_TTL_MS = 60 * 60 * 1000 // re-check plan and models hourly
 const ACCOUNT_RETRY_MS = 60 * 1000 // after a failed check, try again a minute later
 const RENEW_EARLY_MS = 5 * 60 * 1000 // renew Auto's pick 5 minutes before its token expires
@@ -53,7 +56,7 @@ export function createPlugin(deps = {}) {
   const mode = (deps.mode ?? process.env.OPENCODE_COPILOT_AUTO ?? "auto").toLowerCase()
   const log = deps.log ?? (() => {})
 
-  let account // { key, free, models: Set, base, checkedAt, ok }
+  let account // { key, needsAuto, models: Set, base, plan, checkedAt, ok }
   let accountLoad // in-flight account check
   const routes = new Map() // sessionID -> { model, token, until, key }
   const picking = new Map() // sessionID -> in-flight pick
@@ -75,58 +78,67 @@ export function createPlugin(deps = {}) {
     return response.json()
   }
 
-  let host // the plugin context, set in setup
-  const readCredential = () => readCredentialFrom(host)
-
-  async function checkAccount() {
-    const credential = await readCredential()
-    if (!credential) return { key: undefined, free: false, models: new Set(), ok: true }
-    const key = createHash("sha256").update(credential.token).digest("hex").slice(0, 16)
+  async function checkAccount(credential, key) {
     const enterprise = typeof credential.metadata.enterpriseUrl === "string" && credential.metadata.enterpriseUrl
-    const host = enterprise ? enterprise.replace(/^https?:\/\//, "").replace(/\/+$/, "") : undefined
-    const user = await request(`${host ? `https://api.${host}` : "https://api.github.com"}/copilot_internal/user`, {
-      token: credential.token,
-      version: USER_API_VERSION,
-    })
+    const enterpriseHost = enterprise ? enterprise.replace(/^https?:\/\//, "").replace(/\/+$/, "") : undefined
+    const apiHost = enterpriseHost ? `https://api.${enterpriseHost}` : "https://api.github.com"
+    const user = await request(`${apiHost}/copilot_internal/user`, { token: credential.token, version: USER_API_VERSION })
     const base = String(
       user?.endpoints?.api || credential.metadata.apiEndpoint ||
-        (host ? `https://copilot-api.${host}` : "https://api.githubcopilot.com"),
+        (enterpriseHost ? `https://copilot-api.${enterpriseHost}` : "https://api.githubcopilot.com"),
     ).replace(/\/+$/, "")
-    const sku = String(user?.access_type_sku ?? "")
-    const free = /free/i.test(sku) || String(user?.copilot_plan ?? "") === "free"
-    if (!free && mode !== "always") return { key, free, base, models: new Set(), ok: true }
     const list = await request(`${base}/models`, { token: credential.token, version: API_VERSION })
+    const data = (Array.isArray(list?.data) ? list.data : []).filter((m) => m && typeof m.id === "string")
+    // OpenCode serves an account by itself when it can show models or route Auto.
+    const servedByOpenCode = data.some((m) => m.model_picker_enabled === true || m.billing?.auto_discount !== undefined)
     const models = new Set(
-      (Array.isArray(list?.data) ? list.data : [])
+      data
         .filter((m) =>
-          m && typeof m.id === "string" && m.policy?.state === "enabled" &&
+          m.policy?.state === "enabled" &&
           (m.capabilities?.type ?? "chat") === "chat" && m.capabilities?.supports?.tool_calls === true)
         .map((m) => m.id),
     )
-    return { key, free, base, models, ok: true }
+    return { key, needsAuto: !servedByOpenCode, base, models, plan: String(user?.access_type_sku ?? ""), ok: true }
   }
 
-  // Cached account state; never throws (a failed check means "do nothing").
-  async function getAccount() {
-    const age = account ? now() - account.checkedAt : Infinity
-    if (account && age < (account.ok ? ACCOUNT_TTL_MS : ACCOUNT_RETRY_MS)) return account
-    if (!accountLoad) {
-      accountLoad = checkAccount()
+  // The current login, re-read at most every 30 seconds. Never throws.
+  let login // { credential, key, at }
+  async function currentLogin(ctx) {
+    if (login && now() - login.at < CREDENTIAL_TTL_MS) return login
+    let credential
+    try { credential = await readCredentialFrom(ctx) } catch (error) { log("reading the Copilot login failed: " + error.message) }
+    const key = credential ? createHash("sha256").update(credential.token).digest("hex").slice(0, 16) : undefined
+    login = { credential, key, at: now() }
+    return login
+  }
+
+  // Cached account state for the current login; never throws (a failed check means "do nothing").
+  async function getAccount(ctx) {
+    const { credential, key } = await currentLogin(ctx)
+    if (!credential) return { key: undefined, needsAuto: false, models: new Set() }
+    if (account && account.key === key) {
+      const age = now() - account.checkedAt
+      if (age < (account.ok ? ACCOUNT_TTL_MS : ACCOUNT_RETRY_MS)) return account
+    }
+    if (!accountLoad || accountLoad.key !== key) {
+      const load = checkAccount(credential, key)
         .catch((error) => {
           log("account check failed: " + error.message)
-          return { ...(account ?? { free: false, models: new Set() }), ok: false }
+          const previous = account?.key === key ? account : { key, needsAuto: false, models: new Set() }
+          return { ...previous, ok: false }
         })
         .then((result) => {
           account = { ...result, checkedAt: now() }
           return account
         })
-        .finally(() => { accountLoad = undefined })
+        .finally(() => { if (accountLoad?.promise === load) accountLoad = undefined })
+      accountLoad = { key, promise: load }
     }
-    return accountLoad
+    return accountLoad.promise
   }
 
   function active(acct) {
-    return mode !== "off" && acct.key !== undefined && (acct.free || mode === "always")
+    return mode !== "off" && acct.key !== undefined && (acct.needsAuto || mode === "always")
   }
 
   async function promptFor(ctx, sessionID) {
@@ -141,8 +153,8 @@ export function createPlugin(deps = {}) {
   }
 
   async function pick(ctx, sessionID, acct) {
-    const credential = await readCredential()
-    if (!credential) throw new Error("GitHub Copilot isn't connected in OpenCode")
+    const { credential, key } = await currentLogin(ctx)
+    if (!credential || key !== acct.key) throw new Error("the GitHub Copilot login changed; try again")
     const prompt = (await promptFor(ctx, sessionID)) || "Help me with my code."
     const answer = await request(`${acct.base}/auto`, { token: credential.token, version: API_VERSION, body: { prompt } })
     const model = answer?.selected_model?.id
@@ -177,18 +189,18 @@ export function createPlugin(deps = {}) {
     id: "copilot-auto",
     async setup(ctx) {
       if (mode === "off") return
-      host = ctx
       // Check the account now. OpenCode may have built its model list already,
       // so rebuild it once the allowed models are known, to unhide them.
-      getAccount().then((acct) => {
-        if (active(acct) && acct.models.size && typeof ctx.model?.reload === "function") {
+      getAccount(ctx).then((acct) => {
+        if (!active(acct) || !acct.models.size || typeof ctx.model?.reload !== "function") return
+        try {
           Promise.resolve(ctx.model.reload()).catch(() => {})
-        }
+        } catch {}
       })
 
       if (typeof ctx.model?.transform === "function") {
         await ctx.model.transform((models) => {
-          if (!account || !active(account)) return
+          if (!account || !active(account) || account.key !== login?.key) return
           for (const id of account.models) {
             if (models.get(PROVIDER, id)) models.update(PROVIDER, id, (m) => { m.enabled = true })
           }
@@ -197,7 +209,7 @@ export function createPlugin(deps = {}) {
 
       await ctx.session.hook("experimental.model.resolve", async (call) => {
         if (call.kind === "title" || call.model?.providerID !== PROVIDER) return
-        const acct = await getAccount()
+        const acct = await getAccount(ctx)
         if (!active(acct) || !acct.models.has(call.model.id)) return
         let route
         try {

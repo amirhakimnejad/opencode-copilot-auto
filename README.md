@@ -15,7 +15,9 @@ an Auto discount, which Free doesn't have.
 
 ## What the plugin does
 
-On a Copilot Free account it:
+It turns on only when OpenCode can't serve your account by itself: GitHub marks
+none of your models as pickable and none has an Auto discount. That's Copilot
+Free today; the check doesn't rely on plan names. It then:
 
 - shows the chat models GitHub allows your account in the model picker, and
 - routes requests for those models through Auto: it asks Copilot which model to
@@ -23,8 +25,8 @@ On a Copilot Free account it:
   pick for the session until the token is about to expire, or until the session
   is compacted.
 
-On any other Copilot plan it does nothing, so OpenCode's own Copilot support is
-untouched. It doesn't impersonate another client: requests use your OpenCode
+On any other account it does nothing, so OpenCode's own Copilot support is
+untouched. A reconnect or disconnect is noticed within 30 seconds. It doesn't impersonate another client: requests use your OpenCode
 Copilot login and identify themselves as `opencode-copilot-auto`.
 
 ## Install
@@ -46,7 +48,7 @@ only turns the routing on.
 
 | `OPENCODE_COPILOT_AUTO` | Effect |
 |---|---|
-| unset or `auto` | Route through Auto on Copilot Free only |
+| unset or `auto` | Route through Auto only when OpenCode can't serve the account (Copilot Free) |
 | `always` | Route through Auto on every plan |
 | `off` | Do nothing |
 
