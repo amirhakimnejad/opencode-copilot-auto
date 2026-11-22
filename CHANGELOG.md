@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-22)
 
 - Makes GitHub Copilot Free work in OpenCode 2.x by routing requests through Copilot's Auto mode.
 - Turns on only for accounts OpenCode can't serve by itself, and follows login changes within 30 seconds.
