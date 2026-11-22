@@ -9,9 +9,10 @@
 // It turns on only when OpenCode can't serve the account by itself: GitHub marks
 // none of the account's models as pickable and none has an Auto discount. That is
 // Copilot Free today. It then:
-//   - shows the chat models GitHub allows the account in the model picker,
-//   - when one of them is used, asks Auto which model to run and routes the
-//     request there with Auto's session token (Auto decides, not the pick).
+//   - shows one entry in the model picker, "Auto (Copilot picks the model)",
+//     since Auto decides which model answers whatever is picked,
+//   - when it (or any model the account allows) is used, asks Auto which model
+//     to run and routes the request there with Auto's session token.
 // On any other account it does nothing, so OpenCode's own Copilot support is untouched.
 //
 // Set OPENCODE_COPILOT_AUTO=off to turn it off, or =always to route through Auto
@@ -32,6 +33,7 @@ const DEFAULT_ROUTE_MS = 20 * 60 * 1000 // when Auto gives no expiry
 const TIMEOUT_MS = 15 * 1000
 const MAX_SESSIONS = 200
 const MAX_PROMPT_CHARS = 2000
+const AUTO_NAME = "Auto (Copilot picks the model)"
 
 // ---------- reading OpenCode's Copilot login ----------
 
@@ -190,7 +192,7 @@ export function createPlugin(deps = {}) {
     async setup(ctx) {
       if (mode === "off") return
       // Check the account now. OpenCode may have built its model list already,
-      // so rebuild it once the allowed models are known, to unhide them.
+      // so rebuild it once the allowed models are known, to show the Auto entry.
       getAccount(ctx).then((acct) => {
         if (!active(acct) || !acct.models.size || typeof ctx.model?.reload !== "function") return
         try {
@@ -201,9 +203,12 @@ export function createPlugin(deps = {}) {
       if (typeof ctx.model?.transform === "function") {
         await ctx.model.transform((models) => {
           if (!account || !active(account) || account.key !== login?.key) return
-          for (const id of account.models) {
-            if (models.get(PROVIDER, id)) models.update(PROVIDER, id, (m) => { m.enabled = true })
-          }
+          // One picker entry: picking a specific model would be ignored by Auto anyway.
+          // It stands on the first allowed model; the others are hidden.
+          const [entry, ...rest] = [...account.models].filter((id) => models.get(PROVIDER, id))
+          if (!entry) return
+          models.update(PROVIDER, entry, (m) => { m.enabled = true; m.name = AUTO_NAME })
+          for (const id of rest) models.update(PROVIDER, id, (m) => { m.enabled = false })
         })
       }
 
