@@ -1,5 +1,7 @@
 # opencode-copilot-auto
 
+[![npm](https://img.shields.io/npm/v/opencode-copilot-auto)](https://www.npmjs.com/package/opencode-copilot-auto)
+
 Makes **GitHub Copilot Free** work in [OpenCode](https://opencode.ai) 2.x.
 
 ## The problem
