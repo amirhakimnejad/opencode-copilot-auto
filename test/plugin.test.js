@@ -94,22 +94,17 @@ test("only enabled chat models with tool calls count as allowed", async () => {
   }
 })
 
-test("the picker shows one Auto entry and hides the other models", async () => {
+test("allowed models stay switched on and are labelled via Auto, once", async () => {
   const t = setup()
   await t.plugin.setup(t.ctx)
   await t.resolve("mai-code-2-flash") // account loaded
   const models = fakeModels(["mai-code-2-flash", "gpt-6-luna", "claude-opus-5.5"])
-  models.state.get("gpt-6-luna").enabled = true
+  models.state.get("gpt-6-luna").name = "GPT-6 Luna"
   t.transform(models)
-  assert.deepEqual(models.state.get("mai-code-2-flash"), { id: "mai-code-2-flash", enabled: true, name: "Auto (Copilot picks the model)" })
-  assert.equal(models.state.get("gpt-6-luna").enabled, false)
+  t.transform(models) // a reload must not add the label twice
+  assert.deepEqual(models.state.get("mai-code-2-flash"), { id: "mai-code-2-flash", enabled: true, name: "mai-code-2-flash · via Auto" })
+  assert.deepEqual(models.state.get("gpt-6-luna"), { id: "gpt-6-luna", enabled: true, name: "GPT-6 Luna · via Auto" })
   assert.equal(models.state.get("claude-opus-5.5").enabled, false)
-})
-
-test("a hidden allowed model still routes through Auto", async () => {
-  const t = setup()
-  await t.plugin.setup(t.ctx)
-  assert.equal((await t.resolve("gpt-6-luna")).model.id, "mai-code-2-flash")
 })
 
 test("reuses Auto's pick within a session and asks once for parallel calls", async () => {

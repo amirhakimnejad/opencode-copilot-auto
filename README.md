@@ -19,9 +19,10 @@ It turns on only when OpenCode can't serve your account by itself: GitHub marks
 none of your models as pickable and none has an Auto discount. That's Copilot
 Free today; the check doesn't rely on plan names. It then:
 
-- shows one GitHub Copilot entry in the model picker, **Auto (Copilot picks the model)**,
-  because Auto decides which model answers whatever you pick, and
-- routes requests for it (and any other model your account allows) through Auto: it asks Copilot which model to
+- shows the chat models GitHub allows your account in the model picker, each
+  labelled **· via Auto**, because Auto decides which model answers whatever you
+  pick, and
+- routes requests for those models through Auto: it asks Copilot which model to
   use, switches the request to it, and adds Auto's session token. Auto keeps its
   pick for the session until the token is about to expire, or until the session
   is compacted.
@@ -40,7 +41,7 @@ Copilot login and identify themselves as `opencode-copilot-auto`.
    ```
 
    or copy `index.js` to `~/.config/opencode/plugins/copilot-auto.js`.
-3. Restart OpenCode and pick **Auto (Copilot picks the model)** under GitHub Copilot.
+3. Restart OpenCode and pick any GitHub Copilot model marked **· via Auto**.
 
 The model that actually answered is shown under each reply.
 
