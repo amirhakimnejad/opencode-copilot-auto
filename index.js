@@ -22,7 +22,7 @@
 
 import { createHash } from "node:crypto"
 
-export const VERSION = "0.1.1"
+export const VERSION = "0.1.2"
 const PROVIDER = "github-copilot"
 const USER_AGENT = `opencode-copilot-auto/${VERSION}`
 const API_VERSION = "2026-08-01" // what OpenCode 2.3 sends to the Copilot API

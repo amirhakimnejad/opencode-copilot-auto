@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 (2026-11-22)
+
+- README: the install example used `"plugin"`; OpenCode 2.x reads `"plugins"`.
+
 ## 0.1.1 (2026-11-22)
 
 - Fixes 0.1.0 hiding the models Auto routes to. OpenCode refuses a hidden model, so a request failed whenever Auto picked a model other than the picker's one entry. All allowed models stay on again, each labelled "· via Auto".

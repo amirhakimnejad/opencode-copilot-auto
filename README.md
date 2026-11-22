@@ -37,7 +37,7 @@ Copilot login and identify themselves as `opencode-copilot-auto`.
 2. Add the plugin to `opencode.json`:
 
    ```json
-   { "plugin": ["opencode-copilot-auto@0.1.0"] }
+   { "plugins": ["opencode-copilot-auto"] }
    ```
 
    or copy `index.js` to `~/.config/opencode/plugins/copilot-auto.js`.
