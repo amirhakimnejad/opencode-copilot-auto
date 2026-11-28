@@ -47,8 +47,10 @@ message, and on a slow upload Copilot gives up with
   to send one again if it needs to look at it;
 - after a body timeout, retries once with every earlier photo removed, then
   stops instead of sending the same upload over and over (OpenCode tried 7 times
-  or more). If it still fails, the photos in your latest message are too big for
-  your connection: send fewer or smaller ones.
+  or more). If there were no earlier photos to remove, it doesn't retry at all,
+  since the same upload would fail again: the photos in your latest message are
+  too big for your connection, so send fewer or smaller ones. For the rest of that
+  chat (until OpenCode restarts), every earlier photo is left out, whatever the size.
 
 OpenCode 2.4 already shrinks attached photos (a 2 MB photo goes out as about
 400 KB) and leaves out earlier turns' reasoning, so photos are what grows.

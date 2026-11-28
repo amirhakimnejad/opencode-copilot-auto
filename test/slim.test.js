@@ -147,6 +147,30 @@ test("a body timeout retries once with every earlier attachment removed, then st
   assert.deepEqual(second.decision, { retry: false })
 })
 
+test("a body timeout with nothing earlier to remove stops at once", async () => {
+  const { hooks, lines } = await setupHooks({ slimKb: 100 })
+  const body = { input: [developer, user("five photos", photo(300), photo(300))] }
+  await hooks["http.request"]({ sessionID: "s1", request: post(body) })
+  const call = { sessionID: "s1", error: bodyTimeout(), decision: { retry: true, delay: 1000 } }
+  await hooks["retry"](call)
+  assert.deepEqual(call.decision, { retry: false })
+  assert.match(lines.at(-1), /not retrying/)
+})
+
+test("after a body timeout the chat keeps leaving out earlier attachments, even small ones", async () => {
+  const { hooks } = await setupHooks()
+  const body = { input: [developer, user("a", photo(5)), assistant("ok"), user("b")] }
+  await hooks["http.request"]({ sessionID: "s1", request: post(body) })
+  await hooks["retry"]({ sessionID: "s1", error: bodyTimeout(), decision: { retry: true } })
+  await hooks["http.response"]({ sessionID: "s1", response: new Response("{}", { status: 200 }) })
+  const later = { sessionID: "s1", request: post(body) }
+  await hooks["http.request"](later)
+  assert.equal(images(JSON.parse(await later.request.text()).input[1]), 0)
+  const other = { sessionID: "s2", request: post(body) } // other chats are unaffected
+  await hooks["http.request"](other)
+  assert.equal(images(JSON.parse(await other.request.text()).input[1]), 1)
+})
+
 test("a request that gets through resets the timeout count", async () => {
   const { hooks } = await setupHooks()
   await hooks["retry"]({ sessionID: "s1", error: bodyTimeout(), decision: { retry: true } })

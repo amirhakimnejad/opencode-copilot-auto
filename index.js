@@ -71,8 +71,9 @@ const isUserMessage = (item) => item?.role === "user" && (item.type === undefine
 // swapping photos and files of earlier turns for a note, oldest first, while the
 // body is over the limit (or all of them with dropAllAttachments). Everything from
 // the latest user message on is the current turn and stays as it is.
+// stats.attachments is how many were removed, stats.remaining how many earlier ones are still sent.
 export function slimBody(body, { limitBytes, dropAllAttachments = false }) {
-  const stats = { attachments: 0 }
+  const stats = { attachments: 0, remaining: 0 }
   const responses = Array.isArray(body?.input)
   const list = responses ? body.input : Array.isArray(body?.messages) ? body.messages : undefined
   if (!list) return stats
@@ -81,8 +82,6 @@ export function slimBody(body, { limitBytes, dropAllAttachments = false }) {
   if (current <= 0) return stats
 
   const textType = responses ? "input_text" : "text"
-  const size = () => Buffer.byteLength(JSON.stringify(body))
-  let total = dropAllAttachments ? Infinity : size()
   const holders = [] // [array, index] of each earlier attachment, oldest first
   const collect = (value) => {
     if (Array.isArray(value)) {
@@ -95,6 +94,8 @@ export function slimBody(body, { limitBytes, dropAllAttachments = false }) {
     }
   }
   for (let i = 0; i < current; i++) collect(list[i])
+  if (!holders.length) return stats
+  let total = dropAllAttachments ? Infinity : Buffer.byteLength(JSON.stringify(body))
   for (const [array, index] of holders) {
     if (total <= limitBytes) break
     const data = attachmentData(array[index])
@@ -102,6 +103,7 @@ export function slimBody(body, { limitBytes, dropAllAttachments = false }) {
     stats.attachments++
     total = dropAllAttachments ? Infinity : total - Buffer.byteLength(JSON.stringify(data)) + REMOVED_NOTE.length
   }
+  stats.remaining = holders.length - stats.attachments
   return stats
 }
 
@@ -142,7 +144,7 @@ export function createPlugin(deps = {}) {
   })
   const bodyTimeouts = new Map() // sessionID -> body timeouts in a row
   const slowSessions = new Set() // sessions that had a body timeout: drop every earlier attachment
-  const lastSize = new Map() // sessionID -> KB of the last request sent
+  const lastSent = new Map() // sessionID -> { kb, removable } of the last request sent
   const bound = (collection) => {
     while (collection.size > MAX_SESSIONS) collection.delete(collection.keys().next().value)
   }
@@ -291,26 +293,27 @@ export function createPlugin(deps = {}) {
         return
       }
       const before = Buffer.byteLength(text)
-      lastSize.set(call.sessionID, Math.ceil(before / 1024))
-      bound(lastSize)
+      const kb = (bytes) => Math.ceil(bytes / 1024)
       const dropAllAttachments = slowSessions.has(call.sessionID)
-      if (before <= limitBytes && !dropAllAttachments) return
-      const stats = slimBody(body, { limitBytes, dropAllAttachments })
+      // Under the limit nothing is removed; this still counts what a retry could remove.
+      const stats = slimBody(body, { limitBytes: before <= limitBytes && !dropAllAttachments ? Infinity : limitBytes, dropAllAttachments })
+      lastSent.set(call.sessionID, { kb: kb(before), removable: stats.remaining > 0 })
+      bound(lastSent)
       if (!stats.attachments) {
-        log(`request ${Math.round(before / 1024)} KB, nothing earlier to remove`)
+        if (before > limitBytes) log(`request ${kb(before)} KB, nothing earlier to remove`)
         return
       }
       const slimmed = JSON.stringify(body)
       const headers = new Headers(request.headers)
       headers.delete("content-length")
       call.request = new Request(request.url, { method: "POST", headers, body: slimmed, signal: request.signal })
-      lastSize.set(call.sessionID, Math.ceil(Buffer.byteLength(slimmed) / 1024))
-      log(`request ${Math.round(before / 1024)} KB -> ${Math.round(Buffer.byteLength(slimmed) / 1024)} KB ` +
-        `(removed ${stats.attachments} earlier attachments)`)
+      lastSent.set(call.sessionID, { kb: kb(Buffer.byteLength(slimmed)), removable: stats.remaining > 0 })
+      log(`request ${kb(before)} KB -> ${kb(Buffer.byteLength(slimmed))} KB (removed ${stats.attachments} earlier attachments)`)
     }, { providerID: PROVIDER })
 
     // Re-sending the same body after a body timeout fails the same way. From then on
-    // the session drops every earlier attachment; it retries once, then stops.
+    // the session drops every earlier attachment. It retries once if that makes the
+    // request smaller, and otherwise stops at once.
     await ctx.session.hook("retry", (call) => {
       if (!errorText(call.error).includes(BODY_TIMEOUT)) return
       const seen = (bodyTimeouts.get(call.sessionID) ?? 0) + 1
@@ -318,8 +321,11 @@ export function createPlugin(deps = {}) {
       slowSessions.add(call.sessionID)
       bound(bodyTimeouts)
       bound(slowSessions)
-      log(`body timeout ${seen} in a row in ${call.sessionID} (request ${lastSize.get(call.sessionID) ?? "?"} KB)`)
-      if (seen >= 2) call.decision = { retry: false }
+      const sent = lastSent.get(call.sessionID)
+      const smallerRetry = seen < 2 && sent?.removable !== false
+      log(`body timeout ${seen} in a row in ${call.sessionID} (request ${sent?.kb ?? "?"} KB); ` +
+        (smallerRetry ? "retrying without earlier attachments" : "not retrying"))
+      if (!smallerRetry) call.decision = { retry: false }
     }, { providerID: PROVIDER })
 
     // A request that got through starts the count again.
