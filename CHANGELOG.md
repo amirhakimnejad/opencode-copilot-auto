@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.0 (2026-11-28)
+
+- Keeps Copilot requests small on every Copilot account. OpenCode re-sends the whole chat with every message, photos included, and on a slow upload Copilot fails with "Timed out reading request body". Photos and files from earlier messages are now swapped for a short note while a request is over 400 KB (`OPENCODE_COPILOT_SLIM_KB`); the latest message keeps its own.
+- After a body timeout, retries once without any earlier attachments, then stops retrying. OpenCode used to send the same upload 7 times or more.
+- `OPENCODE_COPILOT_SLIM=off` turns both off. `OPENCODE_COPILOT_AUTO_DEBUG=<file>` logs what the plugin does.
+- Tested with OpenCode 2.4.1.
+
 ## 0.1.2 (2026-11-22)
 
 - README: the install example used `"plugin"`; OpenCode 2.x reads `"plugins"`.

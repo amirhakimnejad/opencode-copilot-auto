@@ -174,10 +174,10 @@ test("OPENCODE_COPILOT_AUTO=always routes on a paid plan too", async () => {
   assert.equal((await t.resolve("gpt-6-luna")).model.id, "mai-code-2-flash")
 })
 
-test("OPENCODE_COPILOT_AUTO=off registers nothing", async () => {
+test("OPENCODE_COPILOT_AUTO=off registers no routing, only the request size hooks", async () => {
   const t = setup({ mode: "off" })
   await t.plugin.setup(t.ctx)
-  assert.deepEqual(Object.keys(t.hooks), [])
+  assert.deepEqual(Object.keys(t.hooks).sort(), ["http.request", "http.response", "retry"])
   assert.equal(t.calls.length, 0)
 })
 

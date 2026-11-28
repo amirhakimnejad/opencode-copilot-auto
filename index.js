@@ -19,10 +19,21 @@
 //
 // Set OPENCODE_COPILOT_AUTO=off to turn it off, or =always to route through Auto
 // whatever the plan.
+//
+// Separately, on every Copilot account, it keeps requests small. Copilot stores
+// nothing between requests, so OpenCode re-sends the whole chat each time,
+// including every photo. On a slow upload that soon takes longer than Copilot
+// waits ("Timed out reading request body"). So while a request is over a size
+// limit, it swaps photos and files from earlier messages for a short note, oldest
+// first; the latest message keeps its own. After a body timeout it retries once
+// with every earlier attachment removed, then stops retrying.
+// Set OPENCODE_COPILOT_SLIM=off to turn this off, and OPENCODE_COPILOT_SLIM_KB to
+// change the limit (default 400).
 
 import { createHash } from "node:crypto"
+import { appendFileSync } from "node:fs"
 
-export const VERSION = "0.1.2"
+export const VERSION = "0.2.0"
 const PROVIDER = "github-copilot"
 const USER_AGENT = `opencode-copilot-auto/${VERSION}`
 const API_VERSION = "2026-08-01" // what OpenCode 2.3 sends to the Copilot API
@@ -36,6 +47,68 @@ const TIMEOUT_MS = 15 * 1000
 const MAX_SESSIONS = 200
 const MAX_PROMPT_CHARS = 2000
 const VIA_AUTO = " · via Auto"
+const SLIM_DEFAULT_KB = 400
+const BODY_TIMEOUT = "timed out reading request body"
+const REMOVED_NOTE = "[An attachment sent earlier was removed from this request to keep the upload small. Ask the user to send it again if you need it.]"
+
+// ---------- keeping requests small ----------
+
+const isDataUrl = (value) => typeof value === "string" && value.startsWith("data:")
+
+// The data URL or inline data a content part carries, if it is a photo or file.
+function attachmentData(part) {
+  if (!part || typeof part !== "object") return undefined
+  if (part.type === "input_image" && isDataUrl(part.image_url)) return part.image_url // Responses API
+  if (part.type === "image_url" && isDataUrl(part.image_url?.url)) return part.image_url.url // Chat Completions
+  if (part.type === "input_file" && typeof part.file_data === "string") return part.file_data
+  if (part.type === "file" && typeof part.file?.file_data === "string") return part.file.file_data
+  return undefined
+}
+
+const isUserMessage = (item) => item?.role === "user" && (item.type === undefined || item.type === "message")
+
+// Shrinks a Copilot request body (Responses or Chat Completions) in place by
+// swapping photos and files of earlier turns for a note, oldest first, while the
+// body is over the limit (or all of them with dropAllAttachments). Everything from
+// the latest user message on is the current turn and stays as it is.
+export function slimBody(body, { limitBytes, dropAllAttachments = false }) {
+  const stats = { attachments: 0 }
+  const responses = Array.isArray(body?.input)
+  const list = responses ? body.input : Array.isArray(body?.messages) ? body.messages : undefined
+  if (!list) return stats
+  let current = -1
+  for (let i = list.length - 1; i >= 0; i--) if (isUserMessage(list[i])) { current = i; break }
+  if (current <= 0) return stats
+
+  const textType = responses ? "input_text" : "text"
+  const size = () => Buffer.byteLength(JSON.stringify(body))
+  let total = dropAllAttachments ? Infinity : size()
+  const holders = [] // [array, index] of each earlier attachment, oldest first
+  const collect = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach((part, index) => {
+        if (attachmentData(part) !== undefined) holders.push([value, index])
+        else collect(part)
+      })
+    } else if (value && typeof value === "object") {
+      for (const key of ["content", "output"]) if (value[key] !== undefined) collect(value[key])
+    }
+  }
+  for (let i = 0; i < current; i++) collect(list[i])
+  for (const [array, index] of holders) {
+    if (total <= limitBytes) break
+    const data = attachmentData(array[index])
+    array[index] = { type: textType, text: REMOVED_NOTE }
+    stats.attachments++
+    total = dropAllAttachments ? Infinity : total - Buffer.byteLength(JSON.stringify(data)) + REMOVED_NOTE.length
+  }
+  return stats
+}
+
+function errorText(error) {
+  const parts = [error?.message, error?.response?.body, typeof error === "string" ? error : undefined]
+  return parts.filter((p) => typeof p === "string").join(" ").toLowerCase()
+}
 
 // ---------- reading OpenCode's Copilot login ----------
 
@@ -58,7 +131,21 @@ export function createPlugin(deps = {}) {
   const http = deps.fetch ?? ((...args) => fetch(...args))
   const now = deps.now ?? (() => Date.now())
   const mode = (deps.mode ?? process.env.OPENCODE_COPILOT_AUTO ?? "auto").toLowerCase()
-  const log = deps.log ?? (() => {})
+  const slim = (deps.slim ?? process.env.OPENCODE_COPILOT_SLIM ?? "on").toLowerCase() !== "off"
+  const slimKb = Number(deps.slimKb ?? process.env.OPENCODE_COPILOT_SLIM_KB)
+  const limitBytes = (Number.isFinite(slimKb) && slimKb > 0 ? slimKb : SLIM_DEFAULT_KB) * 1024
+  // OPENCODE_COPILOT_AUTO_DEBUG=/path/to/file appends what the plugin does to that file.
+  const debugFile = process.env.OPENCODE_COPILOT_AUTO_DEBUG
+  const log = deps.log ?? ((line) => {
+    if (!debugFile) return
+    try { appendFileSync(debugFile, `${new Date().toISOString()} ${line}\n`) } catch {}
+  })
+  const bodyTimeouts = new Map() // sessionID -> body timeouts in a row
+  const slowSessions = new Set() // sessions that had a body timeout: drop every earlier attachment
+  const lastSize = new Map() // sessionID -> KB of the last request sent
+  const bound = (collection) => {
+    while (collection.size > MAX_SESSIONS) collection.delete(collection.keys().next().value)
+  }
 
   let account // { key, needsAuto, models: Set, base, plan, checkedAt, ok }
   let accountLoad // in-flight account check
@@ -102,6 +189,8 @@ export function createPlugin(deps = {}) {
           (m.capabilities?.type ?? "chat") === "chat" && m.capabilities?.supports?.tool_calls === true)
         .map((m) => m.id),
     )
+    log(`account: plan ${user?.access_type_sku}, ${data.length} models, ${models.size} allowed, ` +
+      (servedByOpenCode ? "served by OpenCode itself" : "needs Auto"))
     return { key, needsAuto: !servedByOpenCode, base, models, plan: String(user?.access_type_sku ?? ""), ok: true }
   }
 
@@ -189,9 +278,60 @@ export function createPlugin(deps = {}) {
     return pending
   }
 
+  async function setupSlim(ctx) {
+    await ctx.session.hook("http.request", async (call) => {
+      const request = call.request
+      if (!request || request.method !== "POST") return
+      if (!(request.headers.get("content-type") ?? "").includes("json")) return
+      let text, body
+      try {
+        text = await request.clone().text()
+        body = JSON.parse(text)
+      } catch {
+        return
+      }
+      const before = Buffer.byteLength(text)
+      lastSize.set(call.sessionID, Math.ceil(before / 1024))
+      bound(lastSize)
+      const dropAllAttachments = slowSessions.has(call.sessionID)
+      if (before <= limitBytes && !dropAllAttachments) return
+      const stats = slimBody(body, { limitBytes, dropAllAttachments })
+      if (!stats.attachments) {
+        log(`request ${Math.round(before / 1024)} KB, nothing earlier to remove`)
+        return
+      }
+      const slimmed = JSON.stringify(body)
+      const headers = new Headers(request.headers)
+      headers.delete("content-length")
+      call.request = new Request(request.url, { method: "POST", headers, body: slimmed, signal: request.signal })
+      lastSize.set(call.sessionID, Math.ceil(Buffer.byteLength(slimmed) / 1024))
+      log(`request ${Math.round(before / 1024)} KB -> ${Math.round(Buffer.byteLength(slimmed) / 1024)} KB ` +
+        `(removed ${stats.attachments} earlier attachments)`)
+    }, { providerID: PROVIDER })
+
+    // Re-sending the same body after a body timeout fails the same way. From then on
+    // the session drops every earlier attachment; it retries once, then stops.
+    await ctx.session.hook("retry", (call) => {
+      if (!errorText(call.error).includes(BODY_TIMEOUT)) return
+      const seen = (bodyTimeouts.get(call.sessionID) ?? 0) + 1
+      bodyTimeouts.set(call.sessionID, seen)
+      slowSessions.add(call.sessionID)
+      bound(bodyTimeouts)
+      bound(slowSessions)
+      log(`body timeout ${seen} in a row in ${call.sessionID} (request ${lastSize.get(call.sessionID) ?? "?"} KB)`)
+      if (seen >= 2) call.decision = { retry: false }
+    }, { providerID: PROVIDER })
+
+    // A request that got through starts the count again.
+    await ctx.session.hook("http.response", (call) => {
+      if (call.response?.ok) bodyTimeouts.delete(call.sessionID)
+    }, { providerID: PROVIDER })
+  }
+
   return {
     id: "copilot-auto",
     async setup(ctx) {
+      if (slim) await setupSlim(ctx)
       if (mode === "off") return
       // Check the account now. OpenCode may have built its model list already,
       // so rebuild it once the allowed models are known, to unhide them.
@@ -221,7 +361,10 @@ export function createPlugin(deps = {}) {
       await ctx.session.hook("experimental.model.resolve", async (call) => {
         if (call.kind === "title" || call.model?.providerID !== PROVIDER) return
         const acct = await getAccount(ctx)
-        if (!active(acct) || !acct.models.has(call.model.id)) return
+        if (!active(acct) || !acct.models.has(call.model.id)) {
+          if (active(acct)) log(`${call.model.id} is not one of the allowed models (${[...acct.models].join(", ")}); left alone`)
+          return
+        }
         let route
         try {
           route = await routeFor(ctx, call.sessionID, acct)
